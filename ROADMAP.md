@@ -2,121 +2,158 @@
 
 ## Current Status
 
-File format with single magic "SQLCEvfS", inline page index, optional dictionary compression, and encryption support.
+Chunk-based tiered storage (v2): S3/Tigris is source of truth, local disk is a chunk-level LRU cache. 128 pages per chunk at 64KB page size = 8MB per S3 object. Full OLTP with indexes. Supports WAL and DELETE journal modes. 27 tests pass against Tigris.
 
-**Header (64 bytes):**
-```
-Offset  Size  Field
-0       8     Magic "SQLCEvfS"
-8       4     page_size
-12      8     data_start (offset where page records begin)
-20      4     dict_size (0 = no dictionary)
-24      4     flags (bit 0: encrypted)
-28      36    (reserved)
+Speculative chunk prefetching: on cache miss, fetches requested chunk + `prefetch_ahead` adjacent chunks in parallel via tokio::spawn. Default: 8 chunks ahead.
 
-Dictionary Section (optional, if dict_size > 0):
-Offset  Size       Field
-64      dict_size  zstd dictionary bytes
-
-Data Section:
-Offset      Size     Field
-data_start  varies   Page records (page_num:8 + size:4 + data)
-```
+Benchmark (tiered-bench): realistic event-log workload (1M-2M rows, JSON metadata, multiple indexes). Tests hot/warm/cold/constrained tiers with truly cold measurements (fresh VFS per iteration).
 
 ---
 
-## Phase 1: Dictionary Compression Integration ✅
+## Phase 8: Interior Page Detection + Weighted Eviction
 
-### Completed
-- [x] Pre-compiled EncoderDictionary/DecoderDictionary in CompressedHandle
-- [x] compress/decompress methods use dictionaries when available
-- [x] VFS constructors: `new_with_dict()`, `compressed_encrypted_with_dict()`
-- [x] CLI commands: `embed-dict`, `extract-dict`
-- [x] Integration test for dictionary compression
+B-tree internal pages (root, branch nodes) are accessed on every query but LRU treats them the same as leaf pages. Under cache pressure, evicting an internal page causes an S3 re-fetch for the most critical data in the tree. Fix: detect interior pages at read time, evict them last.
 
-### Still TODO
+### Detection (in `read_exact_at`)
+
+SQLite page type is byte 0 of each page (byte 100 for page 0 due to 100-byte DB header):
+- `0x05` = table interior, `0x02` = index interior → mark chunk as interior
+- `0x0a` = table leaf, `0x0d` = index leaf → normal eviction
+- No manifest changes — detection happens organically at read time
+- Interior pages are read on every query, so detection converges on first query
+
+### Storage
+
+- Add `interior_chunks: Mutex<HashSet<u64>>` to DiskCache
+- Add `mark_interior(chunk_id: u64)` method
+- No serialization needed — rebuilt from reads on each open
+
+### Eviction
+
+In `evict_if_needed`, sort by `(is_interior ASC, last_access ASC)`:
+- All leaf-only chunks evicted first (oldest to newest)
+- Interior chunks evicted only when no leaf chunks remain
+- Dirty chunk protection unchanged
+
+### Pin chunk 0
+
+Chunk 0 contains page 1 (sqlite_master root + schema). Always accessed, never evict.
+- On VFS open, fetch chunk 0 if not cached
+- Chunk 0 exempt from eviction (treated like dirty chunk)
+- Saves 1 S3 roundtrip on every cold query
+
+### Changes
+
+~20 lines in `src/tiered.rs`:
+- DiskCache: `interior_chunks` field + `mark_interior()` method
+- `read_exact_at`: check page type byte after decompression, call `mark_interior`
+- `evict_if_needed`: partition sort — leaf chunks first, interior chunks last
+- VFS open: eagerly fetch + pin chunk 0
+
+---
+
+## Phase 9: Hop-Based Adaptive Prefetching
+
+Current prefetch is fixed-size (`prefetch_ahead` chunks on every miss). Wastes bandwidth on point lookups (fetches 9 chunks for 1 page) and isn't aggressive enough for full scans. Fix: exponentially escalate prefetch window on consecutive cache misses, reset on hit. Inspired by RocksDB's adaptive readahead.
+
+### Hop escalation
+
+Quartic escalation: `hop_size = hop^4`. Aggressive — SQL semantics require full result sets, not ranked results, so we need to cache fast.
+
+```
+Hop 1:    1 chunk
+Hop 2:   16 chunks
+Hop 3:   81 chunks
+Hop 4:  256 chunks   (cumulative: 354 chunks = 2.8GB)
+Hop 5:  625 chunks   (cumulative: 979 chunks = 7.8GB)
+```
+
+S3 handles massive parallelism, so no artificial cap. Fetch all remaining uncached chunks once hop size exceeds what's left.
+
+### Reset on cache hit
+
+Counter resets to 0 on any cache hit in `read_exact_at`. This naturally adapts:
+- **Point lookup**: root hit → internal hit → 1 leaf miss → fetches 1 chunk. Minimal waste.
+- **Range scan**: misses escalate → by hop 3, fetching 81 chunks per roundtrip.
+- **Full table scan**: 200-chunk DB cached in 3-4 hops. 1000-chunk DB in 5 hops. Wall-clock ≈ 300-500ms.
+- **Mixed workload**: each cache hit resets, so isolated misses between cached regions stay small.
+
+### Cache pressure backoff
+
+Assume cache can hold the entire database (typical deployment). When `cache_max_bytes` is set and cache exceeds 80%, stop prefetching (fetch only requested chunk). When `cache_max_bytes = 0` (unlimited, default), no backoff — prefetch keeps doubling until every chunk is cached.
+
+### State
+
+One field on TieredHandle: `consecutive_misses: u8`. No persistence, no manifest changes, no background tasks.
+
+### Replaces
+
+Removes the fixed `prefetch_ahead: u32` config field. The hop-based approach subsumes it — prefetch size is now dynamic, starting at 0 and growing unbounded based on access pattern + cache pressure.
+
+### Changes
+
+~25 lines in `src/tiered.rs`:
+- TieredHandle: add `consecutive_misses: u8`, remove `prefetch_ahead: u32`
+- TieredConfig: remove `prefetch_ahead` field
+- `read_exact_at` cache hit path: `self.consecutive_misses = 0`
+- `read_exact_at` cache miss path: increment `consecutive_misses`, compute prefetch count as `miss^4`. Fetch all remaining when hop size exceeds uncached chunks.
+- Add cache pressure check: if `cache.total_bytes() > cache.max_bytes * 4/5`, prefetch count = 0
+
+---
+
+## Phase 10: Future Optimizations
+
+### Bidirectional prefetch
+- Track `last_chunk_accessed` on TieredHandle
+- Forward access → prefetch N+1, N+2... (current behavior)
+- Backward access (DESC queries) → prefetch N-1, N-2...
+
+### Application-level parallel fetch API
+- `vfs.fetch_chunks(chunk_ids)` — parallel S3 GETs, populate cache
+- `vfs.fetch_all()` — background hydration (a la Litestream)
+- `vfs.fetch_range(start, end)` — contiguous range fetch
+- Useful when application knows the query pattern (e.g., full export)
+
+### Access pattern tracking (Markov model)
+- `transitions: HashMap<u64, Vec<(u64, u32)>>` — sparse transition counts
+- On miss: `transitions[last_chunk][current_chunk] += 1`
+- Prefetch top-K likely successors from `transitions[N]`
+- Captures B-tree traversal patterns (root → internal → leaf)
+
+### Tiered chunk sizes
+- Small chunks for internal pages (1-2MB), large for data (16-32MB)
+- Requires page-type tracking in manifest (extend Phase 8 detection to persist)
+
+### Chunk-level key ranges
+- Store min/max keys per chunk in manifest
+- `vfs.chunks_for_key_range(start, end)` — binary search for relevant chunks
+- Complex: requires parsing SQLite B-tree cell format
+
+---
+
+## Phase 1: Remaining
+
 - [ ] Add `--dict <path>` flag to sqlces-bench for benchmarking
 
 ---
 
-## Phase 2: Parallel Compression in Compaction ✅
+## Phase 3: Page-level Checksums (Optional)
 
-### Completed
-- [x] Added `rayon` as optional dependency with `parallel` feature flag
-- [x] Implemented `compact_with_recompression()` function:
-  - Reads all pages sequentially (I/O)
-  - Decompresses and recompresses in parallel with rayon (CPU-bound)
-  - Writes sequentially
-- [x] Added `CompactionConfig` struct for options:
-  - `compression_level`: 1-22 for zstd
-  - `dictionary`: Optional compression dictionary
-  - `parallel`: Enable/disable parallel compression
-- [x] Integration tests for parallel compaction
-- [x] Benchmarks comparing parallel vs serial compaction
-
-### Usage
-```rust
-use sqlite_compress_encrypt_vfs::{compact_with_recompression, CompactionConfig};
-
-// Parallel compaction with default settings (enabled when parallel feature is on)
-let config = CompactionConfig::new(3);
-let freed = compact_with_recompression("database.db", config)?;
-
-// Force serial mode
-let config = CompactionConfig::new(3).with_parallel(false);
-
-// With custom dictionary
-let config = CompactionConfig::new(3).with_dictionary(dict_bytes);
-```
-
-### Notes
-- Original `compact()` preserved for simple dead-space removal (no recompression)
-- `compact_with_recompression()` enables changing compression level or dictionary
-- Expected 4-8x speedup on multi-core systems for large databases
-
----
-
-## Future Phases
-
-### Phase 3: Page-level Checksums (Optional)
 - CRC32 per page for corruption detection (~0.1% storage overhead, ~0.8µs per page)
 - Optional verification on read
 - Note: SQLite itself doesn't have checksums by default (cksumvfs is an extension)
 - Note: AES-GCM already provides authentication for encrypted databases
 - Decision: Implement only if users request it
 
-### Phase 4: Client-Controlled Compaction Helpers ✅
-- [x] `compact_if_needed(path, threshold_pct)` - compact if dead_space exceeds threshold
-  - Returns `Ok(Some(bytes_freed))` if compaction ran
-  - Returns `Ok(None)` if below threshold
-- Document recommended patterns for embedded use:
-  - On startup (check + compact if needed)
-  - On graceful shutdown
-  - Periodic (client's choice)
-- Library provides tools, client decides policy
-
-```rust
-use sqlite_compress_encrypt_vfs::compact_if_needed;
-
-// Compact if dead space exceeds 20%
-if let Some(freed) = compact_if_needed("database.db", 20.0)? {
-    println!("Freed {} bytes", freed);
-}
-```
-
 ---
 
-## Completed
+## Phase 5: Tiered Storage — Remaining
 
-- [x] Single magic "SQLCEvfS" format (no versioned magic bytes)
-- [x] Inline page index (scan on open)
-- [x] Header with dict_size and flags fields
-- [x] zstd compression (levels 1-22)
-- [x] AES-256-GCM encryption
-- [x] WAL mode support
-- [x] Byte-range locking (SQLite protocol)
-- [x] Atomic write_end for concurrent access
-- [x] Debug lock tracing (SQLCES_DEBUG_LOCKS=1)
-- [x] Dictionary compression integration (Phase 1)
-- [x] Parallel compression in compaction (Phase 2)
-- [x] compact_if_needed helper (Phase 4)
+### Encryption in tiered mode
+- [ ] Compose `compress.rs` encrypt/decrypt functions into TieredHandle read/write path
+
+### Multi-writer coordination
+- [ ] Distributed locks for concurrent writers (if needed)
+
+### WAL replication
+- [ ] Replicate WAL to S3 for zero-durability-gap (if needed)

@@ -1,0 +1,8 @@
+app = "sqlces-bench"
+primary_region = "iad"
+
+[build]
+
+[env]
+  TIERED_TEST_BUCKET = "sqlces-bench-storage"
+  RUST_LOG = "warn"

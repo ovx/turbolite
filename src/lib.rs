@@ -33,7 +33,10 @@
 //! - [apersson/redis-compression-module](https://github.com/apersson/redis-compression-module) - Dictionary compression concepts (unlicensed - referenced for ideas only)
 //! - [Twitter cache traces](https://github.com/twitter/cache-trace) - Public cache workload data (CC-BY)
 
+pub mod compress;
 pub mod dict;
+#[cfg(feature = "tiered")]
+pub mod tiered;
 
 use parking_lot::{Mutex, RwLock};
 use sqlite_vfs::{DatabaseHandle, LockKind, OpenAccess, OpenKind, OpenOptions, Vfs};
@@ -111,8 +114,6 @@ fn debug_lock(op: &str, path: &str, from: LockKind, to: LockKind, result: &str) 
 }
 
 // Compressor-specific imports and magic bytes
-#[cfg(feature = "zstd")]
-use zstd::{decode_all, encode_all};
 #[cfg(feature = "zstd")]
 use zstd::dict::{EncoderDictionary, DecoderDictionary};
 
@@ -636,152 +637,55 @@ impl CompressedHandle {
         Ok(key)
     }
 
-    // ===== ZSTD Compression =====
-    #[cfg(feature = "zstd")]
+    // Compression/encryption delegates to free functions in compress module
+
     fn compress(&self, data: &[u8]) -> io::Result<Vec<u8>> {
-        use std::io::Write;
-
-        // Use pre-compiled dictionary if available for better compression
-        if let Some(ref encoder_dict) = self.encoder_dict {
-            let mut encoder = zstd::stream::Encoder::with_prepared_dictionary(Vec::new(), encoder_dict)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            encoder.write_all(data)?;
-            encoder.finish()
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
-        } else {
-            encode_all(data, self.compression_level)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
-        }
+        compress::compress(
+            data,
+            self.compression_level,
+            #[cfg(feature = "zstd")]
+            self.encoder_dict.as_ref(),
+            #[cfg(not(feature = "zstd"))]
+            None,
+        )
     }
 
-    #[cfg(feature = "zstd")]
     fn decompress(&self, data: &[u8]) -> io::Result<Vec<u8>> {
-        use std::io::Read;
-
-        // Use pre-compiled dictionary if available for faster decompression
-        if let Some(ref decoder_dict) = self.decoder_dict {
-            let mut decoder = zstd::stream::Decoder::with_prepared_dictionary(data, decoder_dict)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            let mut output = Vec::new();
-            decoder.read_to_end(&mut output)?;
-            Ok(output)
-        } else {
-            decode_all(data).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
-        }
+        compress::decompress(
+            data,
+            #[cfg(feature = "zstd")]
+            self.decoder_dict.as_ref(),
+            #[cfg(not(feature = "zstd"))]
+            None,
+        )
     }
 
-    // ===== LZ4 Compression =====
-    #[cfg(all(feature = "lz4", not(feature = "zstd")))]
-    fn compress(&self, data: &[u8]) -> io::Result<Vec<u8>> {
-        Ok(compress_prepend_size(data))
-    }
-
-    #[cfg(all(feature = "lz4", not(feature = "zstd")))]
-    fn decompress(&self, data: &[u8]) -> io::Result<Vec<u8>> {
-        decompress_size_prepended(data)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-    }
-
-    // ===== Snappy Compression =====
-    #[cfg(all(feature = "snappy", not(feature = "zstd"), not(feature = "lz4")))]
-    fn compress(&self, data: &[u8]) -> io::Result<Vec<u8>> {
-        let mut encoder = FrameEncoder::new(Vec::new());
-        encoder.write_all(data)?;
-        match encoder.into_inner() {
-            Ok(v) => Ok(v),
-            Err(e) => Err(io::Error::new(io::ErrorKind::Other, e.to_string())),
-        }
-    }
-
-    #[cfg(all(feature = "snappy", not(feature = "zstd"), not(feature = "lz4")))]
-    fn decompress(&self, data: &[u8]) -> io::Result<Vec<u8>> {
-        let mut decoder = FrameDecoder::new(data);
-        let mut output = Vec::new();
-        decoder.read_to_end(&mut output)?;
-        Ok(output)
-    }
-
-    // ===== Gzip Compression =====
-    #[cfg(all(feature = "gzip", not(feature = "zstd"), not(feature = "lz4"), not(feature = "snappy")))]
-    fn compress(&self, data: &[u8]) -> io::Result<Vec<u8>> {
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::new(self.compression_level as u32));
-        encoder.write_all(data)?;
-        encoder.finish()
-    }
-
-    #[cfg(all(feature = "gzip", not(feature = "zstd"), not(feature = "lz4"), not(feature = "snappy")))]
-    fn decompress(&self, data: &[u8]) -> io::Result<Vec<u8>> {
-        let mut decoder = GzDecoder::new(data);
-        let mut output = Vec::new();
-        decoder.read_to_end(&mut output)?;
-        Ok(output)
-    }
-
-    // ===== No Compression (fallback) =====
-    #[cfg(not(any(feature = "zstd", feature = "lz4", feature = "snappy", feature = "gzip")))]
-    fn compress(&self, data: &[u8]) -> io::Result<Vec<u8>> {
-        Ok(data.to_vec())
-    }
-
-    #[cfg(not(any(feature = "zstd", feature = "lz4", feature = "snappy", feature = "gzip")))]
-    fn decompress(&self, data: &[u8]) -> io::Result<Vec<u8>> {
-        Ok(data.to_vec())
-    }
-
-    // ===== AES-GCM Encryption =====
     #[cfg(feature = "encryption")]
     fn encrypt(&self, data: &[u8], page_num: u64) -> io::Result<Vec<u8>> {
         let key = self.encryption_key.as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "No encryption key set"))?;
-
-        let cipher = Aes256Gcm::new(key.into());
-
-        // Use page number as nonce (12 bytes)
-        // This is deterministic but unique per page
-        let mut nonce_bytes = [0u8; 12];
-        nonce_bytes[0..8].copy_from_slice(&page_num.to_le_bytes());
-        let nonce = Nonce::from_slice(&nonce_bytes);
-
-        cipher.encrypt(nonce, data)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Encryption failed: {}", e)))
+        compress::encrypt_gcm(data, page_num, key)
     }
 
     #[cfg(feature = "encryption")]
     fn decrypt(&self, data: &[u8], page_num: u64) -> io::Result<Vec<u8>> {
         let key = self.encryption_key.as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "No encryption key set"))?;
-
-        let cipher = Aes256Gcm::new(key.into());
-
-        // Use same page number as nonce
-        let mut nonce_bytes = [0u8; 12];
-        nonce_bytes[0..8].copy_from_slice(&page_num.to_le_bytes());
-        let nonce = Nonce::from_slice(&nonce_bytes);
-
-        cipher.decrypt(nonce, data)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Decryption failed: {}", e)))
+        compress::decrypt_gcm(data, page_num, key)
     }
 
-    // ===== AES-CTR Encryption (for passthrough mode - no size overhead) =====
     #[cfg(feature = "encryption")]
     fn encrypt_inplace(&self, data: &[u8], offset: u64) -> io::Result<Vec<u8>> {
         let key = self.encryption_key.as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "No encryption key set"))?;
-
-        // Use offset as IV/nonce (16 bytes for CTR mode)
-        let mut iv = [0u8; 16];
-        iv[0..8].copy_from_slice(&offset.to_le_bytes());
-
-        let mut cipher = Aes256Ctr::new(key.into(), &iv.into());
-        let mut result = data.to_vec();
-        cipher.apply_keystream(&mut result);
-        Ok(result)
+        compress::encrypt_ctr(data, offset, key)
     }
 
     #[cfg(feature = "encryption")]
     fn decrypt_inplace(&self, data: &[u8], offset: u64) -> io::Result<Vec<u8>> {
-        // CTR mode: encryption and decryption are the same operation
-        self.encrypt_inplace(data, offset)
+        let key = self.encryption_key.as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "No encryption key set"))?;
+        compress::decrypt_ctr(data, offset, key)
     }
 
     /// Get or create the lock file handle for byte-range locking
@@ -814,7 +718,7 @@ pub struct FileWalIndex {
 }
 
 impl FileWalIndex {
-    fn new(path: PathBuf) -> Self {
+    pub(crate) fn new(path: PathBuf) -> Self {
         Self {
             path,
             regions: HashMap::new(),
@@ -1616,7 +1520,7 @@ impl Vfs for CompressedVfs {
             )
         } else if use_encryption {
             // WAL with encryption - passthrough with in-place encryption
-            let encryption_key = {
+            let encryption_key: Option<[u8; 32]> = {
                 #[cfg(feature = "encryption")]
                 {
                     use sha2::{Sha256, Digest};
