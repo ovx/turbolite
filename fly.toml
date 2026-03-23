@@ -1,8 +1,18 @@
-app = "sqlces-bench"
+app = "cinch-tiered-bench"
 primary_region = "iad"
 
 [build]
 
 [env]
-  TIERED_TEST_BUCKET = "sqlces-bench-storage"
   RUST_LOG = "warn"
+
+[mounts]
+  source = "bench_data"
+  destination = "/data"
+
+[processes]
+  app = "--sizes 1000000 --ppg 4096 --prefetch-threads 1 --prefetch-hops 0.01,0.02,0.97 --iterations 3 --queries post --modes cold,arctic --skip-verify"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256"

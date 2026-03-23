@@ -101,7 +101,26 @@ Removes the fixed `prefetch_ahead: u32` config field. The hop-based approach sub
 
 ---
 
-## Phase 10: Future Optimizations
+## Phase 10: Rename to sqlite-turbo-vfs
+
+Rename the project from `sqlite-compress-encrypt-vfs` / `sqlces` to `sqlite-turbo-vfs` to match `redb-turbo` branding.
+
+### Files to update
+- Directory: `sqlite-compress-encrypt-vfs/` → `sqlite-turbo-vfs/`
+- `Cargo.toml`: package name `sqlite-compress-encrypt-vfs` → `sqlite-turbo-vfs`
+- All `use sqlite_compress_encrypt_vfs::` → `use sqlite_turbo_vfs::` in bin/, tests/, examples/
+- `.gitmodules`: submodule path and URL
+- `redlite-cloud/ROADMAP.md`: path reference
+- `russellromney/website/src/routes/Tools.js`: project listing
+- `sqlite-tantivy/benchmarks/README.md`: cross-project reference
+- Binary names: decide whether `sqlces` CLI becomes `turbo-sqlite` or stays
+- Fly app name: `cinch-tiered-bench` (may keep as-is, it's infra not branding)
+- Soup project: `sqlces` → update or keep
+- Cargo.lock files in redlite/ will regenerate
+
+---
+
+## Phase 11: Future Optimizations
 
 ### Bidirectional prefetch
 - Track `last_chunk_accessed` on TieredHandle

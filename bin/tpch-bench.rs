@@ -478,7 +478,7 @@ fn bench_range(conn: &Connection, iterations: usize, label: &str) -> BenchResult
 
 fn bench_cold_query(
     s3_prefix: &str, db_name: &str, label: &str, sql: &str,
-    iterations: usize, chunk_size_bytes: u64,
+    iterations: usize,
 ) -> BenchResult {
     let mut latencies = Vec::with_capacity(iterations);
     for _ in 0..iterations {
@@ -511,7 +511,7 @@ fn bench_cold_query(
 fn main() {
     let cli = Cli::parse();
     let scale = cli.scale;
-    let chunk_size_bytes: u64 = 128 * 65536; // 8MB chunks
+    let _ppg_bytes: u64 = 2048 * 65536; // ~128MB page groups at 64KB pages
 
     let n_orders = (1_500_000.0 * scale).max(1000.0) as i64;
     let est_db_mb = scale * 1000.0; // rough: SF1 ≈ 1GB
@@ -573,7 +573,7 @@ fn main() {
     // =====================================================================
     println!("--- WARM (disk cache + 20% page cache) ---");
     let warm_vfs_name = unique_vfs_name("warm");
-    let warm_config = make_reader_config(&s3_prefix, cache_dir.path(), 0);
+    let warm_config = make_reader_config(&s3_prefix, cache_dir.path());
     let warm_vfs = TieredVfs::new(warm_config).expect("warm VFS");
     sqlite_compress_encrypt_vfs::tiered::register(&warm_vfs_name, warm_vfs).unwrap();
 
@@ -595,7 +595,7 @@ fn main() {
     for q in &QUERIES {
         cold_results.push(bench_cold_query(
             &s3_prefix, &db_name, &format!("Cold {}", q.label), q.sql,
-            cli.cold_iterations, chunk_size_bytes,
+            cli.cold_iterations,
         ));
     }
     // Cold point

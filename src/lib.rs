@@ -40,7 +40,7 @@ pub mod tiered;
 
 use parking_lot::{Mutex, RwLock};
 use sqlite_vfs::{DatabaseHandle, LockKind, OpenAccess, OpenKind, OpenOptions, Vfs};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions as FsOpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::ops::Range;
@@ -73,6 +73,87 @@ pub fn invalidate_cache<P: AsRef<Path>>(path: P) {
 /// or tests to ensure no stale state is reused.
 pub fn clear_all_caches() {
     SHARED_FILE_CACHE.lock().clear();
+    IN_PROCESS_LOCKS.lock().clear();
+}
+
+// --- In-process lock coordination ---
+// fcntl (used by file-guard) is per-process, not per-thread. Two threads in the
+// same process see no lock conflict via fcntl. This layer provides thread-level
+// mutual exclusion; file-guard remains for cross-process locking.
+
+static CONN_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+static IN_PROCESS_LOCKS: once_cell::sync::Lazy<Mutex<HashMap<PathBuf, InProcessLocks>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
+
+struct InProcessLocks {
+    slots: HashMap<usize, SlotState>,
+}
+
+struct SlotState {
+    shared: HashSet<u64>,
+    exclusive: Option<u64>,
+}
+
+fn try_lock_inprocess(path: &Path, offset: usize, len: usize, exclusive: bool, conn_id: u64) -> bool {
+    let mut map = IN_PROCESS_LOCKS.lock();
+    let locks = map.entry(path.to_path_buf()).or_insert_with(|| InProcessLocks { slots: HashMap::new() });
+
+    // Check all bytes in range first
+    for byte in offset..offset + len {
+        let slot = locks.slots.entry(byte).or_insert_with(|| SlotState {
+            shared: HashSet::new(),
+            exclusive: None,
+        });
+        if exclusive {
+            if slot.exclusive.is_some() && slot.exclusive != Some(conn_id) {
+                return false;
+            }
+            if slot.shared.iter().any(|&id| id != conn_id) {
+                return false;
+            }
+        } else if slot.exclusive.is_some() && slot.exclusive != Some(conn_id) {
+            return false;
+        }
+    }
+
+    // All checks passed — commit
+    for byte in offset..offset + len {
+        let slot = locks.slots.get_mut(&byte).unwrap();
+        if exclusive {
+            slot.exclusive = Some(conn_id);
+            slot.shared.remove(&conn_id);
+        } else {
+            slot.shared.insert(conn_id);
+        }
+    }
+    true
+}
+
+fn unlock_inprocess(path: &Path, offset: usize, len: usize, conn_id: u64) {
+    let mut map = IN_PROCESS_LOCKS.lock();
+    if let Some(locks) = map.get_mut(path) {
+        for byte in offset..offset + len {
+            if let Some(slot) = locks.slots.get_mut(&byte) {
+                slot.shared.remove(&conn_id);
+                if slot.exclusive == Some(conn_id) {
+                    slot.exclusive = None;
+                }
+            }
+        }
+    }
+}
+
+fn unlock_all_inprocess(path: &Path, conn_id: u64) {
+    let mut map = IN_PROCESS_LOCKS.lock();
+    if let Some(locks) = map.get_mut(path) {
+        for slot in locks.slots.values_mut() {
+            slot.shared.remove(&conn_id);
+            if slot.exclusive == Some(conn_id) {
+                slot.exclusive = None;
+            }
+        }
+    }
 }
 
 // SQLite main database lock byte offsets (from sqlite3.c)
@@ -328,9 +409,9 @@ pub struct SharedWriteState {
     write_end: AtomicU64,
     /// Header info (page_size, data_start) - read-only after init
     header: RwLock<FileHeader>,
-    /// Snapshot of the index at creation time - used to initialize new connections
-    /// This is NOT used during operation; each connection has its own index copy.
-    initial_index: RwLock<PageIndex>,
+    /// Live shared index — updated by all connections on write, read by all on read.
+    /// This ensures readers see pages written by checkpoint from other connections.
+    index: RwLock<PageIndex>,
 }
 
 impl SharedWriteState {
@@ -338,18 +419,20 @@ impl SharedWriteState {
         Self {
             write_end: AtomicU64::new(write_end),
             header: RwLock::new(header),
-            initial_index: RwLock::new(index),
+            index: RwLock::new(index),
         }
     }
 }
 
 /// Compressed database file handle
 pub struct CompressedHandle {
+    conn_id: u64,
     file: RwLock<File>,
     /// Per-connection header - contains page_size, data_start, etc.
     header: RwLock<FileHeader>,
-    /// Per-connection index - MUST be per-connection for SQLite isolation.
-    /// Each connection has its own view of the index to maintain consistency.
+    /// Per-connection index — unused for compressed mode (shared index in SharedWriteState
+    /// is used instead). Kept for struct initialization; may be removed in a future cleanup.
+    #[allow(dead_code)]
     index: RwLock<PageIndex>,
     /// Shared write state for lock-free space allocation.
     /// Contains write_end that's shared across connections to avoid collisions.
@@ -438,8 +521,9 @@ impl CompressedHandle {
             let mut cache = SHARED_FILE_CACHE.lock();
 
             let shared_write = if let Some(existing) = cache.get(&canonical_path) {
-                // Cache hit: use existing write_end for space allocation
-                // But we already scanned file to get fresh header/index
+                // Cache hit: use existing shared state.
+                // Merge our freshly-scanned index into the shared index so that
+                // any pages written by other connections are visible.
                 if *DEBUG_SHARED {
                     eprintln!("[SHARED] CACHE HIT {:?} - {} pages (fresh scan), write_end={}",
                         canonical_path.file_name(), index.entries.len(),
@@ -447,10 +531,26 @@ impl CompressedHandle {
                 }
 
                 // Update the cached write_end if our scan found more data
-                // This handles the case where another connection wrote data
                 let cached_write_end = existing.write_end.load(Ordering::SeqCst);
                 if initial_write_end > cached_write_end {
                     existing.write_end.store(initial_write_end, Ordering::SeqCst);
+                }
+
+                // Merge scanned index into shared index (newer offsets win)
+                {
+                    let mut shared_idx = existing.index.write();
+                    for (page_num, (offset, size)) in &index.entries {
+                        let should_update = match shared_idx.entries.get(page_num) {
+                            Some(&(existing_offset, _)) => *offset > existing_offset,
+                            None => true,
+                        };
+                        if should_update {
+                            shared_idx.entries.insert(*page_num, (*offset, *size));
+                        }
+                    }
+                    if index.max_page > shared_idx.max_page {
+                        shared_idx.max_page = index.max_page;
+                    }
                 }
 
                 Arc::clone(existing)
@@ -489,6 +589,7 @@ impl CompressedHandle {
         };
 
         Ok(Self {
+            conn_id: CONN_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
             file: RwLock::new(file),
             header: RwLock::new(header),
             index: RwLock::new(index),
@@ -525,6 +626,7 @@ impl CompressedHandle {
         encryption_key: Option<[u8; 32]>,
     ) -> Self {
         Self {
+            conn_id: CONN_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
             file: RwLock::new(file),
             header: RwLock::new(FileHeader::new()),
             index: RwLock::new(PageIndex::new()),
@@ -704,6 +806,7 @@ impl CompressedHandle {
 
 /// File-backed WAL index for proper multi-connection coordination
 pub struct FileWalIndex {
+    conn_id: u64,
     /// Path to the -shm file
     path: PathBuf,
     /// Cached regions (region_id -> data)
@@ -720,6 +823,7 @@ pub struct FileWalIndex {
 impl FileWalIndex {
     pub(crate) fn new(path: PathBuf) -> Self {
         Self {
+            conn_id: CONN_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
             path,
             regions: HashMap::new(),
             file: None,
@@ -789,34 +893,54 @@ impl sqlite_vfs::wip::WalIndex for FileWalIndex {
         locks: Range<u8>,
         lock: sqlite_vfs::wip::WalIndexLock,
     ) -> Result<bool, io::Error> {
-        // Proper byte-range locking for WAL-index using file-guard
-        // SQLite WAL-index locks are at bytes WAL_LOCK_OFFSET + slot_number
         use sqlite_vfs::wip::WalIndexLock;
 
+        let conn_id = self.conn_id;
         let lock_file = self.ensure_lock_file()?;
 
         match lock {
             WalIndexLock::None => {
-                // Release all locks in the range
                 for slot in locks.clone() {
+                    let offset = WAL_LOCK_OFFSET + slot as u64;
+                    unlock_inprocess(&self.path, offset as usize, 1, conn_id);
                     self.active_locks.remove(&slot);
                 }
             }
             WalIndexLock::Shared | WalIndexLock::Exclusive => {
-                // First, try to acquire ALL locks without modifying state
-                // This ensures atomicity - either all succeed or none are modified
-                let mut new_guards: Vec<(u8, Box<dyn std::any::Any + Send + Sync>)> = Vec::new();
-                let lock_type = if matches!(lock, WalIndexLock::Shared) {
-                    file_guard::Lock::Shared
-                } else {
+                let exclusive = matches!(lock, WalIndexLock::Exclusive);
+                let lock_type = if exclusive {
                     file_guard::Lock::Exclusive
+                } else {
+                    file_guard::Lock::Shared
                 };
+
+                // Phase 1: check all in-process locks first
+                for slot in locks.clone() {
+                    let offset = WAL_LOCK_OFFSET + slot as u64;
+                    if !try_lock_inprocess(&self.path, offset as usize, 1, exclusive, conn_id) {
+                        // Undo any in-process locks we acquired in this loop
+                        for prev_slot in locks.start..slot {
+                            let prev_offset = WAL_LOCK_OFFSET + prev_slot as u64;
+                            unlock_inprocess(&self.path, prev_offset as usize, 1, conn_id);
+                        }
+                        if DEBUG_LOCKS.load(Ordering::Relaxed) {
+                            eprintln!(
+                                "[LOCK DEBUG] {:?} WAL_INDEX {} slot {} {:?} => BUSY (in-process)",
+                                std::thread::current().id(),
+                                self.path.display(),
+                                slot,
+                                lock
+                            );
+                        }
+                        return Ok(false);
+                    }
+                }
+
+                // Phase 2: acquire file locks
+                let mut new_guards: Vec<(u8, Box<dyn std::any::Any + Send + Sync>)> = Vec::new();
 
                 for slot in locks.clone() {
                     let offset = WAL_LOCK_OFFSET + slot as u64;
-
-                    // Release existing lock on this slot first (needed to acquire new one)
-                    // We save it temporarily in case we need to restore
                     let old_guard = self.active_locks.remove(&slot);
 
                     match file_guard::try_lock(
@@ -829,37 +953,29 @@ impl sqlite_vfs::wip::WalIndex for FileWalIndex {
                             new_guards.push((slot, Box::new(guard)));
                         }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                            // Failed - restore any removed locks and the ones we acquired
-                            // Put back the old guard if we had one
                             if let Some(guard) = old_guard {
                                 self.active_locks.insert(slot, guard);
                             }
-                            // Put back all guards we acquired so far (they'll be dropped, releasing locks)
-                            // Actually, we need to restore the original state for already-processed slots
-                            // For simplicity, just drop new_guards - the locks will be released
-                            // The caller will retry if needed
-                            if DEBUG_LOCKS.load(Ordering::Relaxed) {
-                                eprintln!(
-                                    "[LOCK DEBUG] {:?} WAL_INDEX {} slot {} {:?} => BUSY",
-                                    std::thread::current().id(),
-                                    self.path.display(),
-                                    slot,
-                                    lock
-                                );
+                            // Undo all in-process locks for the full range
+                            for s in locks.clone() {
+                                let o = WAL_LOCK_OFFSET + s as u64;
+                                unlock_inprocess(&self.path, o as usize, 1, conn_id);
                             }
                             return Ok(false);
                         }
                         Err(e) => {
-                            // Restore old guard on error
                             if let Some(guard) = old_guard {
                                 self.active_locks.insert(slot, guard);
+                            }
+                            for s in locks.clone() {
+                                let o = WAL_LOCK_OFFSET + s as u64;
+                                unlock_inprocess(&self.path, o as usize, 1, conn_id);
                             }
                             return Err(e);
                         }
                     }
                 }
 
-                // All locks acquired successfully - commit them
                 for (slot, guard) in new_guards {
                     self.active_locks.insert(slot, guard);
                 }
@@ -879,11 +995,46 @@ impl sqlite_vfs::wip::WalIndex for FileWalIndex {
         Ok(true)
     }
 
+    fn pull(&mut self, region: u32, data: &mut [u8; 32768]) -> Result<(), io::Error> {
+        // Re-read the region from the SHM file to see updates from other connections
+        let region_size = 32768u64;
+        let offset = region as u64 * region_size;
+        let file = self.ensure_file()?;
+        use std::os::unix::fs::FileExt;
+        match file.read_exact_at(data, offset) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                // Region doesn't exist yet in file, leave as-is
+            }
+            Err(e) => return Err(e),
+        }
+        self.regions.insert(region, *data);
+        Ok(())
+    }
+
+    fn push(&mut self, region: u32, data: &[u8; 32768]) -> Result<(), io::Error> {
+        // Write the updated region back to the SHM file so other connections can see it
+        let region_size = 32768u64;
+        let offset = region as u64 * region_size;
+        let file = self.ensure_file()?;
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(data, offset)?;
+        self.regions.insert(region, *data);
+        Ok(())
+    }
+
     fn delete(self) -> Result<(), io::Error> {
+        unlock_all_inprocess(&self.path, self.conn_id);
         if self.path.exists() {
             std::fs::remove_file(&self.path)?;
         }
         Ok(())
+    }
+}
+
+impl Drop for CompressedHandle {
+    fn drop(&mut self) {
+        unlock_all_inprocess(&self.db_path, self.conn_id);
     }
 }
 
@@ -897,10 +1048,10 @@ impl DatabaseHandle for CompressedHandle {
             return file.metadata().map(|m| m.len());
         }
 
-        // Return logical size (uncompressed)
-        // Use (max_page + 1) * page_size to account for gaps like SQLite's lock page
+        // Return logical size (uncompressed) from shared index
         let header = self.header.read();
-        let index = self.index.read();
+        let shared = self.shared_write();
+        let index = shared.index.read();
         if header.page_size > 0 && !index.entries.is_empty() {
             Ok((index.max_page + 1) * header.page_size as u64)
         } else {
@@ -938,7 +1089,8 @@ impl DatabaseHandle for CompressedHandle {
 
         let page_num = offset / page_size as u64;
 
-        let index = self.index.read();
+        let shared = self.shared_write();
+        let index = shared.index.read();
         let index_page_count = index.entries.len();
         if let Some(&(file_offset, compressed_size)) = index.entries.get(&page_num) {
             drop(index);
@@ -1062,9 +1214,10 @@ impl DatabaseHandle for CompressedHandle {
 
         drop(file); // Release file read lock before taking index write lock
 
-        // BRIEF INDEX UPDATE: Only lock for HashMap insertion
+        // BRIEF SHARED INDEX UPDATE: All connections see writes immediately
         {
-            let mut index = self.index.write();
+            let shared = self.shared_write();
+            let mut index = shared.index.write();
             index.entries.insert(page_num, (data_offset, data_size));
             if page_num > index.max_page {
                 index.max_page = page_num;
@@ -1125,7 +1278,8 @@ impl DatabaseHandle for CompressedHandle {
 
         let max_page = if size == 0 { 0 } else { (size - 1) / page_size };
 
-        let mut index = self.index.write();
+        let shared = self.shared_write();
+        let mut index = shared.index.write();
         index.entries.retain(|&page_num, _| page_num <= max_page);
 
         Ok(())
@@ -1134,6 +1288,7 @@ impl DatabaseHandle for CompressedHandle {
     fn lock(&mut self, lock: LockKind) -> Result<bool, io::Error> {
         let current = *self.lock.read();
         let path = self.db_path.to_string_lossy().to_string();
+        let conn_id = self.conn_id;
 
         // No change needed
         if current == lock {
@@ -1146,46 +1301,31 @@ impl DatabaseHandle for CompressedHandle {
         // Get or create the lock file handle for byte-range locking
         let lock_file = self.ensure_lock_file()?;
 
-        // SQLite lock escalation using proper byte-range locks:
-        // - NONE: No locks
-        // - SHARED: Shared lock on one byte in SHARED_FIRST..SHARED_FIRST+SHARED_SIZE
-        // - RESERVED: Keep SHARED, add exclusive lock on RESERVED_BYTE
-        // - PENDING: Keep SHARED+RESERVED, add exclusive lock on PENDING_BYTE
-        // - EXCLUSIVE: Replace SHARED with exclusive lock on SHARED range
-
         match lock {
             LockKind::None => {
-                // Release all locks by clearing the active_db_locks map
                 debug_lock("UNLOCK", &path, current, lock, "releasing all");
+                unlock_all_inprocess(&self.db_path, conn_id);
                 self.active_db_locks.clear();
             }
 
             LockKind::Shared => {
                 // Release any existing locks first
+                unlock_all_inprocess(&self.db_path, conn_id);
                 self.active_db_locks.clear();
 
-                // SQLite protocol: First check PENDING_BYTE
-                // If a writer holds exclusive PENDING, they're waiting to write - block new readers
-                // This prevents writer starvation where fast readers constantly get shared locks
-                match file_guard::try_lock(
-                    std::sync::Arc::clone(&lock_file),
-                    file_guard::Lock::Shared,
-                    PENDING_BYTE as usize,
-                    1,
-                ) {
-                    Ok(_pending_guard) => {
-                        // Got shared on PENDING - no writer waiting, drop it and continue
-                        // We don't keep this lock, it's just a check
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        // Writer has exclusive PENDING - they're waiting to write
-                        debug_lock("ACQUIRE", &path, current, lock, "FAILED (writer has PENDING)");
-                        return Ok(false);
-                    }
-                    Err(e) => return Err(e),
+                // Check PENDING_BYTE — if a writer holds exclusive, block new readers
+                if !try_lock_inprocess(&self.db_path, PENDING_BYTE as usize, 1, false, conn_id) {
+                    debug_lock("ACQUIRE", &path, current, lock, "FAILED (writer has PENDING)");
+                    return Ok(false);
                 }
+                // Transient check — release immediately
+                unlock_inprocess(&self.db_path, PENDING_BYTE as usize, 1, conn_id);
 
-                // Now try to get shared lock on SHARED range
+                // Acquire shared lock on SHARED range
+                if !try_lock_inprocess(&self.db_path, SHARED_FIRST as usize, 1, false, conn_id) {
+                    debug_lock("ACQUIRE", &path, current, lock, "FAILED (shared busy)");
+                    return Ok(false);
+                }
                 match file_guard::try_lock(
                     std::sync::Arc::clone(&lock_file),
                     file_guard::Lock::Shared,
@@ -1196,21 +1336,27 @@ impl DatabaseHandle for CompressedHandle {
                         self.active_db_locks.insert("shared".to_string(), Box::new(guard));
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        unlock_inprocess(&self.db_path, SHARED_FIRST as usize, 1, conn_id);
                         debug_lock("ACQUIRE", &path, current, lock, "FAILED (shared busy)");
                         return Ok(false);
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        unlock_inprocess(&self.db_path, SHARED_FIRST as usize, 1, conn_id);
+                        return Err(e);
+                    }
                 }
             }
 
             LockKind::Reserved => {
-                // Must have SHARED first (SQLite protocol)
                 if !matches!(current, LockKind::Shared | LockKind::Reserved | LockKind::Pending | LockKind::Exclusive) {
                     debug_lock("ACQUIRE", &path, current, lock, "FAILED (must have SHARED first)");
                     return Ok(false);
                 }
 
-                // Try to get exclusive lock on RESERVED_BYTE
+                if !try_lock_inprocess(&self.db_path, RESERVED_BYTE as usize, 1, true, conn_id) {
+                    debug_lock("ACQUIRE", &path, current, lock, "FAILED (reserved busy)");
+                    return Ok(false);
+                }
                 match file_guard::try_lock(
                     std::sync::Arc::clone(&lock_file),
                     file_guard::Lock::Exclusive,
@@ -1221,21 +1367,27 @@ impl DatabaseHandle for CompressedHandle {
                         self.active_db_locks.insert("reserved".to_string(), Box::new(guard));
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        unlock_inprocess(&self.db_path, RESERVED_BYTE as usize, 1, conn_id);
                         debug_lock("ACQUIRE", &path, current, lock, "FAILED (reserved busy)");
                         return Ok(false);
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        unlock_inprocess(&self.db_path, RESERVED_BYTE as usize, 1, conn_id);
+                        return Err(e);
+                    }
                 }
             }
 
             LockKind::Pending => {
-                // Must have RESERVED first
                 if !matches!(current, LockKind::Reserved | LockKind::Pending | LockKind::Exclusive) {
                     debug_lock("ACQUIRE", &path, current, lock, "FAILED (must have RESERVED first)");
                     return Ok(false);
                 }
 
-                // Try to get exclusive lock on PENDING_BYTE
+                if !try_lock_inprocess(&self.db_path, PENDING_BYTE as usize, 1, true, conn_id) {
+                    debug_lock("ACQUIRE", &path, current, lock, "FAILED (pending busy)");
+                    return Ok(false);
+                }
                 match file_guard::try_lock(
                     std::sync::Arc::clone(&lock_file),
                     file_guard::Lock::Exclusive,
@@ -1246,15 +1398,18 @@ impl DatabaseHandle for CompressedHandle {
                         self.active_db_locks.insert("pending".to_string(), Box::new(guard));
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        unlock_inprocess(&self.db_path, PENDING_BYTE as usize, 1, conn_id);
                         debug_lock("ACQUIRE", &path, current, lock, "FAILED (pending busy)");
                         return Ok(false);
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        unlock_inprocess(&self.db_path, PENDING_BYTE as usize, 1, conn_id);
+                        return Err(e);
+                    }
                 }
             }
 
             LockKind::Exclusive => {
-                // Must have at least RESERVED first
                 if !matches!(current, LockKind::Reserved | LockKind::Pending | LockKind::Exclusive) {
                     debug_lock("ACQUIRE", &path, current, lock, "FAILED (need RESERVED first)");
                     return Ok(false);
@@ -1262,6 +1417,10 @@ impl DatabaseHandle for CompressedHandle {
 
                 // If we don't have PENDING yet, get it first
                 if !self.active_db_locks.contains_key("pending") {
+                    if !try_lock_inprocess(&self.db_path, PENDING_BYTE as usize, 1, true, conn_id) {
+                        debug_lock("ACQUIRE", &path, current, lock, "FAILED (pending busy)");
+                        return Ok(false);
+                    }
                     match file_guard::try_lock(
                         std::sync::Arc::clone(&lock_file),
                         file_guard::Lock::Exclusive,
@@ -1272,15 +1431,33 @@ impl DatabaseHandle for CompressedHandle {
                             self.active_db_locks.insert("pending".to_string(), Box::new(guard));
                         }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            unlock_inprocess(&self.db_path, PENDING_BYTE as usize, 1, conn_id);
                             debug_lock("ACQUIRE", &path, current, lock, "FAILED (pending busy)");
                             return Ok(false);
                         }
-                        Err(e) => return Err(e),
+                        Err(e) => {
+                            unlock_inprocess(&self.db_path, PENDING_BYTE as usize, 1, conn_id);
+                            return Err(e);
+                        }
                     }
                 }
 
-                // Release shared lock, then get exclusive lock on entire shared range
+                // Release shared, then get exclusive on entire shared range
+                unlock_inprocess(&self.db_path, SHARED_FIRST as usize, 1, conn_id);
                 self.active_db_locks.remove("shared");
+
+                if !try_lock_inprocess(&self.db_path, SHARED_FIRST as usize, SHARED_SIZE as usize, true, conn_id) {
+                    // Restore shared
+                    try_lock_inprocess(&self.db_path, SHARED_FIRST as usize, 1, false, conn_id);
+                    let _ = file_guard::try_lock(
+                        std::sync::Arc::clone(&lock_file),
+                        file_guard::Lock::Shared,
+                        SHARED_FIRST as usize,
+                        1,
+                    ).map(|guard| self.active_db_locks.insert("shared".to_string(), Box::new(guard)));
+                    debug_lock("ACQUIRE", &path, current, lock, "FAILED (exclusive busy)");
+                    return Ok(false);
+                }
 
                 match file_guard::try_lock(
                     std::sync::Arc::clone(&lock_file),
@@ -1292,7 +1469,9 @@ impl DatabaseHandle for CompressedHandle {
                         self.active_db_locks.insert("exclusive".to_string(), Box::new(guard));
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        // Restore shared lock since we failed - this MUST succeed or we're in trouble
+                        // Restore shared (in-process + file)
+                        unlock_inprocess(&self.db_path, SHARED_FIRST as usize, SHARED_SIZE as usize, conn_id);
+                        try_lock_inprocess(&self.db_path, SHARED_FIRST as usize, 1, false, conn_id);
                         match file_guard::try_lock(
                             std::sync::Arc::clone(&lock_file),
                             file_guard::Lock::Shared,
@@ -1303,8 +1482,6 @@ impl DatabaseHandle for CompressedHandle {
                                 self.active_db_locks.insert("shared".to_string(), Box::new(guard));
                             }
                             Err(restore_err) => {
-                                // Critical: We lost our shared lock and can't restore it
-                                // This leaves us in an inconsistent state - return error
                                 debug_lock("ACQUIRE", &path, current, lock,
                                     "FAILED (exclusive busy, CRITICAL: shared restore failed!)");
                                 return Err(io::Error::new(
@@ -1316,7 +1493,11 @@ impl DatabaseHandle for CompressedHandle {
                         debug_lock("ACQUIRE", &path, current, lock, "FAILED (exclusive busy)");
                         return Ok(false);
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        unlock_inprocess(&self.db_path, SHARED_FIRST as usize, SHARED_SIZE as usize, conn_id);
+                        try_lock_inprocess(&self.db_path, SHARED_FIRST as usize, 1, false, conn_id);
+                        return Err(e);
+                    }
                 }
             }
         }

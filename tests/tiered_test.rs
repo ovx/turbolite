@@ -97,7 +97,7 @@ mod tiered_tests {
         let version = manifest["version"].as_u64().unwrap();
         let page_count = manifest["page_count"].as_u64().unwrap();
         let page_size = manifest["page_size"].as_u64().unwrap();
-        let chunk_size = manifest["chunk_size"].as_u64().unwrap_or(128);
+        let pages_per_group = manifest["pages_per_group"].as_u64().unwrap_or(2048);
 
         assert!(version >= 1, "manifest version should be >= 1, got {}", version);
         assert!(
@@ -109,15 +109,15 @@ mod tiered_tests {
             page_size, expected_page_size,
             "manifest page_size mismatch"
         );
-        assert_eq!(
-            chunk_size, 128,
-            "manifest chunk_size should be 128, got {}",
-            chunk_size
+        assert!(
+            pages_per_group > 0,
+            "manifest pages_per_group should be > 0, got {}",
+            pages_per_group
         );
     }
 
-    /// Verify that S3 has chunk objects (not page objects) under the prefix.
-    fn verify_s3_has_chunks(
+    /// Verify that S3 has page group objects under the prefix.
+    fn verify_s3_has_page_groups(
         bucket: &str,
         prefix: &str,
         endpoint: &Option<String>,
@@ -137,13 +137,13 @@ mod tiered_tests {
             let resp = client
                 .list_objects_v2()
                 .bucket(bucket)
-                .prefix(format!("{}/chunks/", prefix))
+                .prefix(format!("{}/pg/", prefix))
                 .send()
                 .await
-                .expect("listing chunks should succeed");
+                .expect("listing page groups should succeed");
 
             let count = resp.contents().len();
-            assert!(count > 0, "should have at least 1 chunk object in S3");
+            assert!(count > 0, "should have at least 1 page group object in S3");
             count
         })
     }
@@ -549,11 +549,11 @@ mod tiered_tests {
 
         assert_eq!(count, 10_000, "cold scan should find all 10K rows");
         eprintln!(
-            "Cold scan of 10K rows completed in {:?} (chunk_size=128)",
+            "Cold scan of 10K rows completed in {:?} (pages_per_group=2048)",
             elapsed
         );
 
-        // With chunk_size=128, each chunk GET warms 128 pages at once
+        // With pages_per_group=2048, each page group GET warms 2048 pages at once
         assert!(
             elapsed.as_secs() < 60,
             "Cold scan took too long: {:?}",
@@ -800,12 +800,12 @@ mod tiered_tests {
 
     #[test]
     #[ignore]
-    fn test_chunk_cache_populates() {
+    fn test_page_group_cache_populates() {
         // Write data, checkpoint, then do a cold read and verify that
-        // the cache directory has chunk files (not page files).
+        // the cache directory has data.cache + page_bitmap (page group model).
         let write_cache = TempDir::new().unwrap();
-        let config = test_config("chunkcache", write_cache.path());
-        let vfs_name = unique_vfs_name("tiered_chunkcache_w");
+        let config = test_config("pgcache", write_cache.path());
+        let vfs_name = unique_vfs_name("tiered_pgcache_w");
         let bucket = config.bucket.clone();
         let prefix = config.prefix.clone();
         let endpoint = config.endpoint_url.clone();
@@ -815,7 +815,7 @@ mod tiered_tests {
         sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
-            "chunkcache_test.db",
+            "pgcache_test.db",
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
                 | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
             &vfs_name,
@@ -835,7 +835,7 @@ mod tiered_tests {
             for i in 0..500 {
                 tx.execute(
                     "INSERT INTO cc VALUES (?1, ?2)",
-                    rusqlite::params![i, format!("chunk_cache_data_{:0>200}", i)],
+                    rusqlite::params![i, format!("page_group_cache_data_{:0>200}", i)],
                 )
                 .unwrap();
             }
@@ -845,9 +845,9 @@ mod tiered_tests {
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
             .unwrap();
 
-        // Verify S3 has chunk objects
-        let chunk_count = verify_s3_has_chunks(&bucket, &prefix, &endpoint);
-        eprintln!("S3 has {} chunk objects after checkpoint", chunk_count);
+        // Verify S3 has page group objects
+        let pg_count = verify_s3_has_page_groups(&bucket, &prefix, &endpoint);
+        eprintln!("S3 has {} page group objects after checkpoint", pg_count);
 
         drop(conn);
 
@@ -862,49 +862,45 @@ mod tiered_tests {
             region,
             ..Default::default()
         };
-        let reader_vfs_name = unique_vfs_name("tiered_chunkcache_r");
+        let reader_vfs_name = unique_vfs_name("tiered_pgcache_r");
         let reader_vfs = TieredVfs::new(reader_config).unwrap();
         sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, reader_vfs)
             .unwrap();
 
         let reader = rusqlite::Connection::open_with_flags_and_vfs(
-            "chunkcache_test.db",
+            "pgcache_test.db",
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
             &reader_vfs_name,
         )
         .unwrap();
 
-        // Full scan — triggers chunk fetches from S3
+        // Full scan — triggers page group fetches from S3
         let count: i64 = reader
             .query_row("SELECT COUNT(*) FROM cc", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 500);
 
-        // Check that cache has chunk files, not page files
-        let cache_chunks_dir = cold_cache.path().join("chunks");
-        let cached_chunks = std::fs::read_dir(&cache_chunks_dir)
-            .unwrap()
-            .filter(|e| {
-                e.as_ref()
-                    .map(|e| !e.file_name().to_string_lossy().ends_with(".tmp"))
-                    .unwrap_or(false)
-            })
-            .count();
-
-        eprintln!("Cached {} chunks after cold scan", cached_chunks);
-
-        // Should have at least 1 chunk cached (chunk 0 at minimum)
+        // Verify cache has data.cache file (uncompressed page store)
+        // The cache file is under {cache_dir}/{db_name}/data.cache
+        let db_cache_dir = cold_cache.path().join("pgcache_test.db");
+        let cache_file = db_cache_dir.join("data.cache");
         assert!(
-            cached_chunks >= 1,
-            "cache should have chunk files, got {}",
-            cached_chunks
+            cache_file.exists(),
+            "data.cache should exist after cold read"
         );
-
-        // Verify NO pages directory exists (old format)
-        let old_pages_dir = cold_cache.path().join("pages");
+        let cache_size = std::fs::metadata(&cache_file).unwrap().len();
         assert!(
-            !old_pages_dir.exists(),
-            "old pages/ directory should not exist in v2"
+            cache_size > 0,
+            "data.cache should have nonzero size, got {}",
+            cache_size
+        );
+        eprintln!("data.cache size after cold scan: {} bytes", cache_size);
+
+        // Verify page_bitmap exists
+        let bitmap_file = db_cache_dir.join("page_bitmap");
+        assert!(
+            bitmap_file.exists(),
+            "page_bitmap should exist after cold read"
         );
     }
 
@@ -1201,16 +1197,17 @@ mod tiered_tests {
         assert_eq!(count, 30);
     }
 
-    /// Verify LRU cache eviction works — when cache exceeds max_bytes,
-    /// oldest chunks get evicted.
+    /// Verify TTL-based page group eviction: reads work correctly even after
+    /// page groups would be evicted. Data is re-fetched from S3 as needed.
     #[test]
     #[ignore]
-    fn test_lru_eviction() {
-        // Write enough data to generate multiple chunks, then read with a
-        // very small cache_max_bytes to force eviction.
+    fn test_ttl_eviction() {
+        // Write enough data to generate multiple page groups, then verify
+        // data integrity with cold reads (TTL eviction is time-based, so
+        // here we just verify the full read path works with page groups).
         let write_cache = TempDir::new().unwrap();
-        let config = test_config("lru_evict", write_cache.path());
-        let vfs_name = unique_vfs_name("tiered_lru_w");
+        let config = test_config("ttl_evict", write_cache.path());
+        let vfs_name = unique_vfs_name("tiered_ttl_w");
         let bucket = config.bucket.clone();
         let prefix = config.prefix.clone();
         let endpoint = config.endpoint_url.clone();
@@ -1220,7 +1217,7 @@ mod tiered_tests {
         sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
-            "lru_evict_test.db",
+            "ttl_evict_test.db",
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
                 | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
             &vfs_name,
@@ -1230,18 +1227,17 @@ mod tiered_tests {
         conn.execute_batch(
             "PRAGMA page_size=65536;
              PRAGMA journal_mode=WAL;
-             CREATE TABLE lru (id INTEGER PRIMARY KEY, data BLOB);",
+             CREATE TABLE ttl (id INTEGER PRIMARY KEY, data BLOB);",
         )
         .unwrap();
 
-        // Insert enough data to create multiple 64KB pages (and thus chunks)
         // Each row ~8KB, 200 rows = ~1.6MB = ~25 pages at 64KB
         let blob = vec![0x42u8; 8192];
         {
             let tx = conn.unchecked_transaction().unwrap();
             for i in 0..200 {
                 tx.execute(
-                    "INSERT INTO lru VALUES (?1, ?2)",
+                    "INSERT INTO ttl VALUES (?1, ?2)",
                     rusqlite::params![i, blob],
                 )
                 .unwrap();
@@ -1253,7 +1249,7 @@ mod tiered_tests {
             .unwrap();
         drop(conn);
 
-        // Open reader with very small cache (64KB) — forces eviction
+        // Open reader — all data fetched from S3 into cache file
         let cold_cache = TempDir::new().unwrap();
         let reader_config = TieredConfig {
             bucket: bucket.clone(),
@@ -1261,45 +1257,30 @@ mod tiered_tests {
             cache_dir: cold_cache.path().to_path_buf(),
             endpoint_url: endpoint.clone(),
             read_only: true,
-            // No cache limits — unbounded cache
             region: region.clone(),
             ..Default::default()
         };
-        let reader_vfs_name = unique_vfs_name("tiered_lru_r");
+        let reader_vfs_name = unique_vfs_name("tiered_ttl_r");
         let reader_vfs = TieredVfs::new(reader_config).unwrap();
         sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, reader_vfs)
             .unwrap();
 
         let reader = rusqlite::Connection::open_with_flags_and_vfs(
-            "lru_evict_test.db",
+            "ttl_evict_test.db",
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
             &reader_vfs_name,
         )
         .unwrap();
 
-        // Full scan — will fetch chunks and evict older ones
+        // Full scan — fetches page groups from S3
         let count: i64 = reader
-            .query_row("SELECT COUNT(*) FROM lru", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM ttl", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 200, "should read all rows despite cache eviction");
+        assert_eq!(count, 200, "should read all rows from page groups");
 
-        // Cache should be bounded — check that total cached size is small
-        let cache_chunks_dir = cold_cache.path().join("chunks");
-        let total_cached: u64 = std::fs::read_dir(&cache_chunks_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| !e.file_name().to_string_lossy().ends_with(".tmp"))
-            .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
-            .sum();
-
-        eprintln!(
-            "Total cached bytes after scan with max_bytes=64KB: {} bytes",
-            total_cached
-        );
-
-        // Verify data integrity — specific row lookup (may require re-fetch from S3)
+        // Verify data integrity — specific row lookup
         let data: Vec<u8> = reader
-            .query_row("SELECT data FROM lru WHERE id = 100", [], |row| {
+            .query_row("SELECT data FROM ttl WHERE id = 100", [], |row| {
                 row.get(0)
             })
             .unwrap();
@@ -1878,7 +1859,7 @@ mod tiered_tests {
 
     /// Full OLTP with secondary indexes: INSERT, UPDATE, DELETE, then checkpoint
     /// and cold read. Verifies internal B-tree pages (from indexes) are handled
-    /// correctly in chunk storage.
+    /// correctly in page group storage.
     #[test]
     #[ignore]
     fn test_oltp_with_indexes() {
@@ -2043,7 +2024,7 @@ mod tiered_tests {
         eprintln!("OLTP with indexes test passed: 3 indexes, insert/update/delete, cold read");
     }
 
-    /// UPDATE and DELETE operations exercise read-modify-write of existing chunks.
+    /// UPDATE and DELETE operations exercise read-modify-write of existing page groups.
     /// Verifies data integrity after modifying and deleting rows across multiple
     /// checkpoints.
     #[test]
@@ -2180,7 +2161,7 @@ mod tiered_tests {
     }
 
     /// Multiple tables in the same database. Verifies that internal B-tree pages
-    /// and schema table pages are correctly stored in chunks.
+    /// and schema table pages are correctly stored in page groups.
     #[test]
     #[ignore]
     fn test_multiple_tables() {
@@ -2291,15 +2272,15 @@ mod tiered_tests {
         assert_eq!(join_count, 100, "join should return all orders");
     }
 
-    /// Non-default chunk_size (8 pages instead of 128). Verifies the chunk
-    /// encoding/decoding and S3 layout work with smaller chunks.
+    /// Non-default pages_per_group (8 pages instead of 2048). Verifies the
+    /// page group encoding/decoding and S3 layout work with smaller groups.
     #[test]
     #[ignore]
-    fn test_custom_chunk_size() {
+    fn test_custom_pages_per_group() {
         let cache_dir = TempDir::new().unwrap();
-        let mut config = test_config("custom_cs", cache_dir.path());
-        config.chunk_size = 8; // Very small chunks for testing
-        let vfs_name = unique_vfs_name("tiered_cs8");
+        let mut config = test_config("custom_ppg", cache_dir.path());
+        config.pages_per_group = 8; // Very small page groups for testing
+        let vfs_name = unique_vfs_name("tiered_ppg8");
         let bucket = config.bucket.clone();
         let prefix = config.prefix.clone();
         let endpoint = config.endpoint_url.clone();
@@ -2309,7 +2290,7 @@ mod tiered_tests {
         sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
-            "custom_cs_test.db",
+            "custom_ppg_test.db",
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
                 | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
             &vfs_name,
@@ -2323,13 +2304,13 @@ mod tiered_tests {
         )
         .unwrap();
 
-        // Insert enough data to span multiple chunks (8 pages per chunk)
+        // Insert enough data to span multiple page groups (8 pages per group)
         {
             let tx = conn.unchecked_transaction().unwrap();
             for i in 0..500 {
                 tx.execute(
                     "INSERT INTO cs VALUES (?1, ?2)",
-                    rusqlite::params![i, format!("chunk_size_8_data_{:0>200}", i)],
+                    rusqlite::params![i, format!("ppg_8_data_{:0>200}", i)],
                 )
                 .unwrap();
             }
@@ -2339,12 +2320,12 @@ mod tiered_tests {
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
             .unwrap();
 
-        // With chunk_size=8, we should have more chunk objects than with chunk_size=128
-        let chunk_count = verify_s3_has_chunks(&bucket, &prefix, &endpoint);
-        eprintln!("chunk_size=8: {} chunk objects in S3", chunk_count);
-        assert!(chunk_count >= 1, "should have chunk objects with chunk_size=8");
+        // With pages_per_group=8, we should have more page group objects
+        let pg_count = verify_s3_has_page_groups(&bucket, &prefix, &endpoint);
+        eprintln!("pages_per_group=8: {} page group objects in S3", pg_count);
+        assert!(pg_count >= 1, "should have page group objects with ppg=8");
 
-        // Verify manifest has chunk_size=8
+        // Verify manifest has pages_per_group=8
         let rt = tokio::runtime::Runtime::new().unwrap();
         let manifest_data = rt.block_on(async {
             let aws_config = aws_config::from_env()
@@ -2367,14 +2348,14 @@ mod tiered_tests {
         });
         let manifest: serde_json::Value = serde_json::from_slice(&manifest_data).unwrap();
         assert_eq!(
-            manifest["chunk_size"].as_u64().unwrap(),
+            manifest["pages_per_group"].as_u64().unwrap(),
             8,
-            "manifest should have chunk_size=8"
+            "manifest should have pages_per_group=8"
         );
 
         drop(conn);
 
-        // Cold read with chunk_size=8
+        // Cold read with pages_per_group=8
         let cold_cache = TempDir::new().unwrap();
         let reader_config = TieredConfig {
             bucket,
@@ -2382,17 +2363,17 @@ mod tiered_tests {
             cache_dir: cold_cache.path().to_path_buf(),
             endpoint_url: endpoint,
             read_only: true,
-            chunk_size: 8,
+            pages_per_group: 8,
             region,
             ..Default::default()
         };
-        let reader_vfs_name = unique_vfs_name("tiered_cs8_r");
+        let reader_vfs_name = unique_vfs_name("tiered_ppg8_r");
         let reader_vfs = TieredVfs::new(reader_config).unwrap();
         sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, reader_vfs)
             .unwrap();
 
         let reader = rusqlite::Connection::open_with_flags_and_vfs(
-            "custom_cs_test.db",
+            "custom_ppg_test.db",
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
             &reader_vfs_name,
         )
@@ -2401,11 +2382,11 @@ mod tiered_tests {
         let count: i64 = reader
             .query_row("SELECT COUNT(*) FROM cs", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 500, "all rows should survive with chunk_size=8");
+        assert_eq!(count, 500, "all rows should survive with pages_per_group=8");
     }
 
     /// Blobs larger than page size trigger SQLite overflow pages. Verifies
-    /// overflow page chains work correctly with chunk storage.
+    /// overflow page chains work correctly with page group storage.
     #[test]
     #[ignore]
     fn test_large_overflow_blobs() {
@@ -2691,10 +2672,10 @@ mod tiered_tests {
 
         // S3 data MUST still exist after connection close + WAL cleanup
         verify_s3_manifest(&bucket, &prefix, &endpoint, 1, 65536);
-        let chunks_after = verify_s3_has_chunks(&bucket, &prefix, &endpoint);
+        let pg_after = verify_s3_has_page_groups(&bucket, &prefix, &endpoint);
         assert!(
-            chunks_after >= 1,
-            "S3 chunks must survive connection close"
+            pg_after >= 1,
+            "S3 page groups must survive connection close"
         );
 
         // Cold read from fresh cache to prove S3 data survived
@@ -2811,16 +2792,15 @@ mod tiered_tests {
         assert_eq!(cold_count, 200, "cold read in DELETE mode must work");
     }
 
-    /// Write with chunk_size=128 (default), read with TieredConfig chunk_size=64.
-    /// The reader must use the manifest's chunk_size (128), not the config's (64).
-    /// Without the fix, this would read wrong pages or panic.
+    /// Write with default pages_per_group=2048, read with config pages_per_group=64.
+    /// The reader must use the manifest's pages_per_group, not the config's.
     #[test]
     #[ignore]
-    fn test_chunk_size_mismatch_uses_manifest() {
-        // Write with default chunk_size=128
+    fn test_ppg_mismatch_uses_manifest() {
+        // Write with default pages_per_group=2048
         let write_cache = TempDir::new().unwrap();
-        let config = test_config("cs_mismatch", write_cache.path());
-        let vfs_name = unique_vfs_name("tiered_csmm_w");
+        let config = test_config("ppg_mismatch", write_cache.path());
+        let vfs_name = unique_vfs_name("tiered_ppgmm_w");
         let bucket = config.bucket.clone();
         let prefix = config.prefix.clone();
         let endpoint = config.endpoint_url.clone();
@@ -2830,7 +2810,7 @@ mod tiered_tests {
         sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
-            "cs_mismatch_test.db",
+            "ppg_mismatch_test.db",
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
                 | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
             &vfs_name,
@@ -2860,8 +2840,8 @@ mod tiered_tests {
             .unwrap();
         drop(conn);
 
-        // Read with DIFFERENT chunk_size in config (64 instead of 128).
-        // The VFS must use the manifest's chunk_size (128) to read correctly.
+        // Read with DIFFERENT pages_per_group in config (64 instead of 2048).
+        // The VFS must use the manifest's pages_per_group to read correctly.
         let cold_cache = TempDir::new().unwrap();
         let reader_config = TieredConfig {
             bucket,
@@ -2869,27 +2849,26 @@ mod tiered_tests {
             cache_dir: cold_cache.path().to_path_buf(),
             endpoint_url: endpoint,
             read_only: true,
-            chunk_size: 64, // DIFFERENT from writer's 128
+            pages_per_group: 64, // DIFFERENT from writer's 2048
             region,
             ..Default::default()
         };
-        let reader_vfs_name = unique_vfs_name("tiered_csmm_r");
+        let reader_vfs_name = unique_vfs_name("tiered_ppgmm_r");
         let reader_vfs = TieredVfs::new(reader_config).unwrap();
         sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, reader_vfs)
             .unwrap();
 
         let reader = rusqlite::Connection::open_with_flags_and_vfs(
-            "cs_mismatch_test.db",
+            "ppg_mismatch_test.db",
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
             &reader_vfs_name,
         )
         .unwrap();
 
-        // This would fail (wrong data or panic) without the manifest chunk_size fix
         let count: i64 = reader
             .query_row("SELECT COUNT(*) FROM csm", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 200, "reader with mismatched config chunk_size should use manifest's");
+        assert_eq!(count, 200, "reader with mismatched pages_per_group should use manifest's");
 
         let val: String = reader
             .query_row(
@@ -2898,6 +2877,6 @@ mod tiered_tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(val.starts_with("mismatch_data_"), "data integrity with mismatched chunk_size");
+        assert!(val.starts_with("mismatch_data_"), "data integrity with mismatched pages_per_group");
     }
 }
